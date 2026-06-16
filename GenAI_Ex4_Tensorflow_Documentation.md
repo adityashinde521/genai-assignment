@@ -174,7 +174,8 @@ The most subtle implementation challenge was the training step. GANs require **u
 ```python
 @tf.function
 def train_step(images):
-    noise = tf.random.normal([BATCH_SIZE, noise_dim])
+    batch_size = tf.shape(images)[0]
+    noise = tf.random.normal([batch_size, noise_dim])
 
     # ---- Train Discriminator (Generator is frozen) ----
     with tf.GradientTape() as disc_tape:
@@ -189,7 +190,7 @@ def train_step(images):
     # ---- Train Generator (Discriminator is frozen) ----
     with tf.GradientTape() as gen_tape:
         generated_images = generator(noise, training=True)
-        fake_output = discriminator(generated_images, training=True)
+        fake_output = discriminator(generated_images, training=False)
         gen_loss = generator_loss(fake_output)
 
     gen_grads = gen_tape.gradient(gen_loss, generator.trainable_variables)
@@ -202,9 +203,11 @@ def train_step(images):
 
 1. **The generator is called twice** — once for D training and once for G training. This is necessary because we need fresh generated images for each tape. An alternative is to use a persistent tape, but two separate tapes is cleaner.
 
-2. **`@tf.function` decorator**: This compiles the function to a TensorFlow graph, giving significant speedup. It's applied to `train_step` because this is the performance-critical inner loop. The notebook explicitly passes `training=True` to all `model()` calls inside the tapes — this ensures BatchNorm and Dropout behave correctly during training.
+2. **`@tf.function` and dynamic batch size**: Using `tf.shape(images)[0]` instead of the Python constant `BATCH_SIZE` for the noise shape ensures the last mini-batch (which has fewer samples than a full batch — FashionMNIST's 60,000 images don't divide evenly by 256) is handled correctly. With a hardcoded `BATCH_SIZE`, the final batch would pair 96 real images against 256 fake images in the discriminator loss, creating an unbalanced update. Using `tf.shape` also avoids an unnecessary `@tf.function` retrace on that batch.
 
-3. **Variable scoping**: `disc_tape.gradient(disc_loss, discriminator.trainable_variables)` only computes gradients w.r.t. D's weights. The generator's weights don't receive gradients from the disc_tape, so D's update step implicitly "freezes" G.
+3. **`training=True` vs `training=False` for the discriminator**: Inside `disc_tape`, both the generator and discriminator run with `training=True` (BatchNorm updates running stats, Dropout is active) — correct for the discriminator update. Inside `gen_tape`, the discriminator is called with `training=False`. This is important: calling it with `training=True` would let the discriminator's BatchNorm running statistics absorb fake-image statistics during the generator update pass, and Dropout would add noise to the gradient signal flowing to the generator. Using `training=False` gives the generator a stable, deterministic gradient path through the discriminator. The discriminator's weights are still not updated (its variables are not watched by `gen_tape`), so "frozen" in the weight-update sense either way — but `training=False` also freezes its internal state.
+
+4. **Variable scoping**: `disc_tape.gradient(disc_loss, discriminator.trainable_variables)` only computes gradients w.r.t. D's weights. The generator's weights don't receive gradients from the disc_tape, so D's update step implicitly "freezes" G.
 
 ---
 
@@ -227,7 +230,9 @@ def train(dataset, epochs):
         # ... TensorBoard logging, checkpointing, timing
 ```
 
-**Checkpointing every 15 epochs:** The model is saved at epochs 15, 30, 45, and implicitly at 50 (final call to `generate_and_log_images`). Checkpoints are saved to `./training_checkpoints/ckpt`.
+**Checkpointing every 15 epochs:** The model is saved at epochs 15, 30, and 45. Checkpoints are saved to `./training_checkpoints/ckpt`.
+
+**Training output stays visible:** All epoch progress lines remain in the cell output after training completes — there is no `clear_output()` call. This makes it easy to review the full loss history directly in the notebook without needing TensorBoard.
 
 ---
 
@@ -237,9 +242,11 @@ The notebook logs:
 - **Scalar losses** every epoch: `loss/L_Generator` and `loss/L_Discriminator`
 - **Generated images** every epoch: a 4×4 grid of samples from the fixed `seed` noise
 
+Before logging, generated images are rescaled from the generator's tanh output range of `[-1, 1]` to `[0, 1]` via `(predictions + 1.0) / 2.0`. This is necessary because `tf.summary.image` expects float images in `[0, 1]` and silently clips values outside that range — without the rescaling, all pixels with negative tanh activations (dark regions) would be clipped to 0 and appear as pure black in TensorBoard, making the logged images look visually worse than the actual generated output. The matplotlib save path already applied the correct `* 127.5 + 127.5` denormalization, but the TensorBoard path required its own fix.
+
 This allows tracking:
 - Whether losses are diverging (training failure)
-- How image quality progresses over epochs
+- How image quality progresses over epochs, with accurate grayscale rendering
 
 To start TensorBoard:
 ```bash
@@ -307,6 +314,12 @@ This creates a GIF showing the progression from random noise to recognizable clo
 5. **`@tf.function` matters for performance** — without it, training is 10–50× slower (Python overhead per step). Always decorate the train_step
 
 6. **TF GPU on Windows requires WSL2** — native GPU support was dropped after TF 2.10. For student projects, CPU is fine for 28×28 images; for serious work, Google Colab or a Linux machine with a CUDA-capable GPU is recommended
+
+7. **Use `tf.shape()` for dynamic batch sizes, not Python constants** — `BATCH_SIZE` is a Python integer baked in at trace time. The last batch of any dataset is typically smaller, creating mismatched real/fake sample counts in the discriminator loss. `tf.shape(images)[0]` resolves this at runtime and avoids an unnecessary `@tf.function` retrace each epoch
+
+8. **`tf.summary.image` requires `[0, 1]` float inputs** — tanh generator output is in `[-1, 1]`; values outside `[0, 1]` are silently clipped. Always rescale with `(predictions + 1.0) / 2.0` before logging images to TensorBoard
+
+9. **Discriminator inference mode during generator update** — calling `discriminator(x, training=False)` inside the generator's GradientTape prevents the discriminator's BatchNorm running statistics from drifting on fake-image batches and removes Dropout noise from the generator's gradient path, leading to more stable generator updates
 
 ---
 

@@ -116,7 +116,7 @@ The network learns `mu` and `logvar` (log-variance for numerical stability), and
 ```
 z (batch, 16)
 → Linear(16 → 256) + ReLU
-→ Linear(256 → 3136) + ReLU
+→ Linear(256 → 3136)             [no activation — signed values improve decoder expressiveness]
 → Reshape  →  (batch, 64, 7, 7)
 → ConvTranspose2d(64→32, 4×4, stride=2, pad=1) + ReLU  →  (batch, 32, 14, 14)
 → ConvTranspose2d(32→1, 4×4, stride=2, pad=1) + Sigmoid  →  (batch, 1, 28, 28)
@@ -124,7 +124,7 @@ z (batch, 16)
 
 I used `ConvTranspose2d` (transposed convolutions, or "deconvolutions") rather than upsampling + conv. The kernel size 4 with stride 2 and padding 1 exactly doubles the spatial dimensions: `(7-1)*2 - 2*1 + 4 = 14` ✓
 
-The final `Sigmoid` activation ensures the output is in [0, 1], matching the normalized input.
+**Why no activation after the second linear layer?** A ReLU here would clamp all 3136 feature map values to non-negative before the ConvTranspose2d layers, halving the representable input space for the deconvolution. Removing it lets the transpose-conv layers receive signed activations and use their full dynamic range. The final `Sigmoid` in `decoder_conv` still bounds the output to [0, 1].
 
 **Total parameters: 962,817** — manageable for CPU training.
 
@@ -165,11 +165,13 @@ This term encourages the learned latent distribution to stay close to the standa
 
 I used **Adam** with `lr=1e-3` for 10 epochs, as specified by the skeleton. Batch size was 128.
 
+The `train_vae` function accepts `device` as an explicit parameter (defaulting to the device the model lives on via `next(model.parameters()).device`) and returns the per-epoch loss history as a list. After training completes, the loss curve is plotted with matplotlib, giving a visual confirmation of convergence without relying on console printouts alone.
+
 **Observed loss progression (2-epoch test):**
 - Epoch 1: ~473.84
 - Epoch 2: ~467.16
 
-The loss decreases monotonically, which is a good sign. For the full 10-epoch run, we'd expect the loss to continue dropping and plateau around epoch 5–8.
+The loss decreases monotonically, which is a good sign. For the full 10-epoch run, we'd expect the loss to continue dropping and plateau around epoch 5–8. The plotted loss curve makes it easy to spot divergence or stagnation at a glance.
 
 **Training time on CPU:** Approximately 2–3 minutes per epoch with 78,468 images at batch size 128 (~614 batches/epoch). Total for 10 epochs: ~25–30 minutes on CPU.
 
@@ -177,7 +179,7 @@ The loss decreases monotonically, which is a good sign. For the full 10-epoch ru
 
 ## 7. Results: Reconstruction
 
-After training, I displayed 8 pairs of original vs. reconstructed images from the test set. The reconstructions capture the overall structure (lungs, ribcage, general brightness) but appear blurrier than the originals.
+After training, I displayed 8 pairs of original vs. reconstructed images from the test set. The reconstructions capture the overall structure (lungs, ribcage, general brightness) but appear blurrier than the originals. Row labels ("Original" / "Reconstructed") are placed using `ax.text(transform=ax.transAxes)` rather than `set_ylabel`, since `axis('off')` suppresses axis label rendering regardless of when `set_ylabel` is called.
 
 **Why blurry?**  
 The BCE reconstruction loss averages pixel errors independently. The model minimizes this by producing the "expected" reconstruction — an average over possible images given the latent code. This averaging effect creates blur. This is a fundamental limitation of VAEs with pixel-wise losses; GANs avoid this by using a discriminator.
@@ -203,6 +205,9 @@ I sampled 16 latent vectors `z ~ N(0, I)` and decoded them. The generated images
 3. **VAEs produce smooth but blurry outputs** — this is the bias/variance trade-off of the evidence lower bound (ELBO) objective
 4. **Environment management matters** — the conda environment with pinned Python 3.12 saved significant debugging time
 5. **Medical images are interesting** — even at 28×28, you can see anatomical structures in the learned representations
+6. **Decoder architecture matters** — a trailing ReLU before reshaping into transposed-conv layers constrains the feature space to non-negative values; removing it gives the deconvolution layers full signed dynamic range
+7. **`axis('off')` hides labels** — use `ax.text(transform=ax.transAxes)` instead of `set_ylabel` when turning off axes; the latter is suppressed at render time regardless of call order
+8. **Always return training metrics** — having `train_vae` return the loss history enables post-training plotting without re-running training
 
 ---
 
